@@ -17,8 +17,14 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from garminconnect import Garmin, GarminConnectAuthenticationError
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
-mcp = FastMCP("garmin")
+mcp = FastMCP(
+    "garmin",
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=False,
+    ),
+)
 
 _client: Garmin | None = None
 
