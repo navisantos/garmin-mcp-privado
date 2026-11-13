@@ -100,6 +100,21 @@ should use `garmin-mcp-auth` instead.
 **Token cache location:** `~/.garminconnect` by default, or the path in
 `GARMIN_TOKENS` if set.
 
+## Personal API key (recommended)
+
+Garmin now offers an official way to read your own data. Create a key at
+<https://connect.garmin.com/app/settings/personalApiToken> and set it as
+`GARMIN_PERSONAL_API_KEY`. No email, password or MFA is involved, and the
+server renews the 24-hour access token by itself. The key expires after the
+period you pick (30 days to 1 year); Garmin emails a reminder a week before, and
+you replace it by deleting the old key and creating a new one.
+
+The Personal API is read-only and covers activities (including `.fit` files, used
+for laps), daily stats, sleep, heart rate, Body Battery, HRV and VO2 max. It does
+**not** offer training status, personal records, lactate threshold or race
+predictions — those tools use the legacy login below if you keep one configured,
+and otherwise return an error.
+
 ## Remote / hosted mode (use from Claude mobile & web)
 
 By default this server speaks stdio and is meant to run as a local subprocess

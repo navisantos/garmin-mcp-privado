@@ -15,6 +15,9 @@ dependencies = [
     # this server imports. Lift the ceiling only together with a port to the 2.x API.
     "mcp[cli]>=1.0,<2",
     "garminconnect>=0.3.3",
+    # Official Garmin Personal API client + FIT lap parsing (see personal_api.py).
+    "requests>=2.31",
+    "fitdecode>=0.10",
 ]
 
 [project.optional-dependencies]
