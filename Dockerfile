@@ -13,4 +13,5 @@ EXPOSE 8765
 # MCP_PATH environment variable (set it in Render) and is never committed.
 # `:?` makes the container refuse to start if it's missing, rather than fall
 # back to a guessable public path.
-CMD garmin-mcp --transport streamable-http --host 0.0.0.0 --port $PORT --path "/${MCP_PATH:?Set MCP_PATH to a long random string}/mcp"
+CMD P="${MCP_PATH:?Set MCP_PATH to a long random string}"; P="${P#/}"; P="${P%/}"; \
+    exec garmin-mcp --transport streamable-http --host 0.0.0.0 --port $PORT --path "/$P/mcp"
