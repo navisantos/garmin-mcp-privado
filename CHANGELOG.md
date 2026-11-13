@@ -7,6 +7,25 @@ All notable changes to this project are documented here. Format follows
 ## [Unreleased]
 
 ### Added
+- **Garmin Personal API support.** Set `GARMIN_PERSONAL_API_KEY` (create it at
+  https://connect.garmin.com/app/settings/personalApiToken) and the server reads
+  from Garmin's official API instead of logging in with email/password/MFA. The
+  key is exchanged for a 24h bearer token that is renewed automatically and kept
+  in memory only. Activities, laps (parsed from the original `.fit`), daily
+  stats, sleep, heart rate, Body Battery, HRV and VO2 max are served this way.
+  Tools the Personal API doesn't offer (`get_training_status`,
+  `get_personal_records`, `get_threshold_history`, lactate threshold and race
+  predictions in `get_performance_metrics`) fall back to the legacy login when
+  one is configured, otherwise return a clear error. Without the key nothing
+  changes.
+- `get_hrv(date)` — overnight HRV summary.
+- `GARMIN_TZ` env var to choose the timezone used for "today" (default
+  `Europe/Oslo`).
+
+### Changed
+- Dockerfile: the connector's secret URL path now comes from the `MCP_PATH`
+  environment variable instead of being hardcoded; the container refuses to
+  start without it.
 - `get_personal_records()` — personal records / PBs. Labels the common running
   records (fastest 1km/1mile/5km/10km, longest run) and formats their values
   (clock string for time records, "X.XX km" for distance); any other/unmapped

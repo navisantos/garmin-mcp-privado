@@ -9,4 +9,9 @@ RUN uv pip install --system .
 
 EXPOSE 8765
 
-CMD garmin-mcp --transport streamable-http --host 0.0.0.0 --port $PORT --path /5Y6YsuQJjXHpokFt_jHslvh4QkLc2iBEFRwrKuLlUNU/mcp
+# The endpoint path is the connector's only secret, so it comes from the
+# MCP_PATH environment variable (set it in Render) and is never committed.
+# `:?` makes the container refuse to start if it's missing, rather than fall
+# back to a guessable public path.
+CMD P="${MCP_PATH:?Set MCP_PATH to a long random string}"; P="${P#/}"; P="${P%/}"; \
+    exec garmin-mcp --transport streamable-http --host 0.0.0.0 --port $PORT --path "/$P/mcp"

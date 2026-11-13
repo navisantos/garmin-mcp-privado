@@ -10,7 +10,7 @@ import json
 import os
 from collections.abc import Callable
 from datetime import date as _date
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -18,6 +18,9 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from garminconnect import Garmin, GarminConnectAuthenticationError
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+
+from garmin_mcp import personal_api
+from garmin_mcp.personal_api import PersonalApi, PersonalApiError
 
 mcp = FastMCP(
     "garmin",
@@ -30,8 +33,9 @@ _client: Garmin | None = None
 
 # "Today" always means the user's local calendar day, but this server may run on
 # a UTC host. Resolving in UTC would push a late-evening session onto the next
-# day's date, so anchor date defaults to Europe/Oslo.
-_LOCAL_TZ_NAME = "Europe/Oslo"
+# day's date, so the anchor timezone is explicit. Defaults to Europe/Oslo; set
+# GARMIN_TZ (e.g. America/Sao_Paulo) to use your own.
+_LOCAL_TZ_NAME = os.environ.get("GARMIN_TZ", "Europe/Oslo")
 
 _AUTH_HELP = (
     "No Garmin session available. Run `garmin-mcp-auth` once to log in "
@@ -95,6 +99,97 @@ def _tool_call(build: Callable[[Garmin], Any]) -> str:
         return json.dumps({"error": "Garmin authentication expired. Run `garmin-mcp-auth` to log in again."})
     except Exception as exc:  # noqa: BLE001 - always return JSON, never raise to the client
         return json.dumps({"error": f"Garmin request failed: {exc}"})
+
+
+# --- Personal API backend ---------------------------------------------------
+#
+# When GARMIN_PERSONAL_API_KEY is set, tools read from Garmin's official
+# Personal API (no password, no MFA). Tools the Personal API doesn't offer fall
+# back to the legacy garminconnect login if one is configured, otherwise they
+# return a clear JSON error.
+
+_personal: PersonalApi | None = None
+_UNSUPPORTED_HELP = (
+    "Not available through the Garmin Personal API, and no legacy Garmin login "
+    "(GARMIN_EMAIL/GARMIN_PASSWORD or a cached token) is configured as a fallback."
+)
+
+
+def _personal_enabled() -> bool:
+    return personal_api.api_key_from_env() is not None
+
+
+def get_personal() -> PersonalApi:
+    """Return a lazily-initialized, cached Personal API client."""
+    global _personal
+    if _personal is None:
+        key = personal_api.api_key_from_env()
+        if key is None:
+            raise PersonalApiError(f"{personal_api.API_KEY_ENV_VAR} is not set")
+        _personal = PersonalApi(key)
+    return _personal
+
+
+def _legacy_available() -> bool:
+    if os.environ.get("GARMIN_EMAIL") and os.environ.get("GARMIN_PASSWORD"):
+        return True
+    return Path(_token_store()).expanduser().exists()
+
+
+def _personal_call(build: Callable[[PersonalApi], Any]) -> str:
+    """Like _tool_call, but against the Personal API. Always returns JSON."""
+    try:
+        data = build(get_personal())
+        return json.dumps(data, default=str, separators=(",", ":"))
+    except PersonalApiError as exc:
+        return json.dumps({"error": str(exc)})
+    except Exception as exc:  # noqa: BLE001 - always return JSON, never raise to the client
+        return json.dumps({"error": f"Garmin request failed: {exc}"})
+
+
+def _dispatch(
+    personal: Callable[[PersonalApi], Any] | None = None,
+    legacy: Callable[[Garmin], Any] | None = None,
+) -> str:
+    """Route a tool to the Personal API when enabled, else to the legacy client.
+
+    `personal=None` marks a tool the Personal API can't serve: it then uses the
+    legacy client if one is configured, or returns an explanatory error.
+    """
+    if _personal_enabled():
+        if personal is not None:
+            return _personal_call(personal)
+        if legacy is not None and _legacy_available():
+            return _tool_call(legacy)
+        return json.dumps({"error": _UNSUPPORTED_HELP})
+    if legacy is None:
+        return json.dumps({"error": "This tool needs GARMIN_PERSONAL_API_KEY to be set."})
+    return _tool_call(legacy)
+
+
+def _as_list(payload: Any) -> list:
+    """Normalize a list-ish Personal API payload (bare list or wrapped list)."""
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in ("activityList", "activities", "data", "items"):
+            if isinstance(payload.get(key), list):
+                return payload[key]
+    return []
+
+
+def _personal_activities_between(p: PersonalApi, start_date: str, end_date: str) -> list:
+    """Fetch every activity in a date range, paging through the search endpoint."""
+    page_size, max_pages = 100, 10
+    out: list = []
+    for page in range(max_pages):
+        batch = _as_list(
+            p.search_activities(start=page * page_size, limit=page_size, start_date=start_date, end_date=end_date)
+        )
+        out.extend(batch)
+        if len(batch) < page_size:
+            break
+    return out
 
 
 def _fmt_activity_summary(a: dict) -> dict:
@@ -413,7 +508,10 @@ def list_recent_activities(limit: int = 10) -> str:
     and pace_min_per_km. `limit` caps how many activities come back
     (default 10).
     """
-    return _tool_call(lambda c: [_fmt_activity_summary(a) for a in c.get_activities(0, limit)])
+    return _dispatch(
+        personal=lambda p: [_fmt_activity_summary(a) for a in _as_list(p.search_activities(limit=limit))],
+        legacy=lambda c: [_fmt_activity_summary(a) for a in c.get_activities(0, limit)],
+    )
 
 
 @mcp.tool()
@@ -438,7 +536,14 @@ def get_activity_details(activity_id: str) -> str:
         details = {k: v for k, v in detail.items() if k not in _ACTIVITY_DETAIL_STRIP_KEYS}
         return {**summary, "timing": _fmt_timing(summary), "details": details}
 
-    return _tool_call(build)
+    # The Personal API has no per-sample "details" endpoint, so there the
+    # response carries the summary + timing only (use get_activity_laps for
+    # the per-lap breakdown).
+    def build_personal(p: PersonalApi) -> dict:
+        summary = p.get_activity(activity_id)
+        return {**summary, "timing": _fmt_timing(summary)}
+
+    return _dispatch(personal=build_personal, legacy=build)
 
 
 @mcp.tool()
@@ -456,15 +561,22 @@ def get_activity_laps(activity_id: str, include_gps: bool = False) -> str:
     to include them.
     """
 
-    def build(c: Garmin) -> dict:
-        laps = c.get_activity_splits(activity_id).get("lapDTOs") or []
+    def shape(laps: list, gps: bool) -> dict:
         return {
             "activity_id": activity_id,
             "lap_count": len(laps),
-            "laps": [_fmt_lap(lap, include_gps) for lap in laps],
+            "laps": [_fmt_lap(lap, gps) for lap in laps],
         }
 
-    return _tool_call(build)
+    def build(c: Garmin) -> dict:
+        return shape(c.get_activity_splits(activity_id).get("lapDTOs") or [], include_gps)
+
+    # The Personal API has no splits endpoint; laps come from the original .fit
+    # file. GPS is never read there, so include_gps has no effect on this path.
+    def build_personal(p: PersonalApi) -> dict:
+        return shape(personal_api.laps_from_fit(p.download_fit(activity_id)), False)
+
+    return _dispatch(personal=build_personal, legacy=build)
 
 
 @mcp.tool()
@@ -474,7 +586,12 @@ def list_activities_by_date(start_date: str, end_date: str) -> str:
     `start_date` and `end_date` must be "YYYY-MM-DD". Returns a JSON array
     of activity summaries in the same shape as list_recent_activities.
     """
-    return _tool_call(lambda c: [_fmt_activity_summary(a) for a in c.get_activities_by_date(start_date, end_date)])
+    return _dispatch(
+        personal=lambda p: [
+            _fmt_activity_summary(a) for a in _personal_activities_between(p, start_date, end_date)
+        ],
+        legacy=lambda c: [_fmt_activity_summary(a) for a in c.get_activities_by_date(start_date, end_date)],
+    )
 
 
 @mcp.tool()
@@ -485,7 +602,12 @@ def get_daily_stats(date: str) -> str:
     totalSteps, totalKilocalories, restingHeartRate, averageStressLevel,
     bodyBatteryHighestValue/LowestValue, and floorsAscended.
     """
-    return _tool_call(lambda c: c.get_stats(date))
+
+    def build_personal(p: PersonalApi) -> Any:
+        rows = _as_list(p.get_daily_summaries(date, date))
+        return rows[0] if rows else {"error": f"No daily summary for {date}"}
+
+    return _dispatch(personal=build_personal, legacy=lambda c: c.get_stats(date))
 
 
 @mcp.tool()
@@ -499,11 +621,13 @@ def get_sleep(date: str) -> str:
     are stripped to keep the response small.
     """
 
-    def build(c: Garmin) -> dict:
-        data = c.get_sleep_data(date)
+    def strip(data: dict) -> dict:
         return {k: v for k, v in data.items() if k not in _SLEEP_STRIP_KEYS}
 
-    return _tool_call(build)
+    return _dispatch(
+        personal=lambda p: strip(p.get_daily_sleep(date) or {}),
+        legacy=lambda c: strip(c.get_sleep_data(date)),
+    )
 
 
 @mcp.tool()
@@ -516,11 +640,13 @@ def get_heart_rate(date: str) -> str:
     response small.
     """
 
-    def build(c: Garmin) -> dict:
-        data = c.get_heart_rates(date)
+    def strip(data: dict) -> dict:
         return {k: v for k, v in data.items() if k != "heartRateValues"}
 
-    return _tool_call(build)
+    return _dispatch(
+        personal=lambda p: strip(p.get_daily_heart_rate(date) or {}),
+        legacy=lambda c: strip(c.get_heart_rates(date)),
+    )
 
 
 @mcp.tool()
@@ -532,7 +658,12 @@ def get_body_battery(start_date: str, end_date: str) -> str:
     lost), highest, and lowest Body Battery level. Per-minute level arrays
     are stripped; highest/lowest are derived from them before stripping.
     """
-    return _tool_call(lambda c: [_fmt_body_battery_day(d) for d in c.get_body_battery(start_date, end_date)])
+    return _dispatch(
+        personal=lambda p: [
+            _fmt_body_battery_day(d) for d in _as_list(p.get_daily_body_battery(start_date, end_date))
+        ],
+        legacy=lambda c: [_fmt_body_battery_day(d) for d in c.get_body_battery(start_date, end_date)],
+    )
 
 
 @mcp.tool()
@@ -543,7 +674,7 @@ def get_training_status(date: str) -> str:
     mostRecentTrainingStatus (training status, acute/chronic training load),
     mostRecentVO2Max, and heatAltitudeAcclimationDTO.
     """
-    return _tool_call(lambda c: c.get_training_status(date))
+    return _dispatch(legacy=lambda c: c.get_training_status(date))
 
 
 @mcp.tool()
@@ -583,7 +714,34 @@ def get_performance_metrics(date: str | None = None) -> str:
             "race_predictions": section(c.get_race_predictions, _fmt_race_predictions),
         }
 
-    return _tool_call(build)
+    # Personal API: only VO2 max is available there. Lactate threshold and race
+    # predictions use the legacy login when configured, else report an error.
+    def build_personal(p: PersonalApi) -> dict:
+        def vo2() -> dict:
+            start = (_date.fromisoformat(cdate) - timedelta(days=30)).isoformat()
+            rows = _as_list(p.get_daily_vo2_max(start, cdate))
+            return _fmt_vo2max(rows[-1] if rows else None)
+
+        def legacy_section(fetch: Callable[[Garmin], Any], fmt: Callable[[Any], dict]) -> dict:
+            if not _legacy_available():
+                return {"error": "unavailable via the Garmin Personal API"}
+            try:
+                return fmt(fetch(get_client()))
+            except Exception as exc:  # noqa: BLE001 - one dead endpoint shouldn't sink the others
+                return {"error": f"unavailable: {exc}"}
+
+        try:
+            vo2_section = vo2()
+        except Exception as exc:  # noqa: BLE001
+            vo2_section = {"error": f"unavailable: {exc}"}
+        return {
+            "as_of": cdate,
+            "lactate_threshold": legacy_section(lambda c: c.get_lactate_threshold(latest=True), _fmt_lactate_threshold),
+            "vo2max": vo2_section,
+            "race_predictions": legacy_section(lambda c: c.get_race_predictions(), _fmt_race_predictions),
+        }
+
+    return _dispatch(personal=build_personal, legacy=build)
 
 
 @mcp.tool()
@@ -598,7 +756,9 @@ def get_personal_records() -> str:
     `activity_id`, and `date`. The raw `type_id` and `value` are always kept so
     an unmapped or non-running record is still usable, just unlabeled.
     """
-    return _tool_call(lambda c: [_fmt_personal_record(r) for r in (c.get_personal_record() or []) if isinstance(r, dict)])
+    return _dispatch(
+        legacy=lambda c: [_fmt_personal_record(r) for r in (c.get_personal_record() or []) if isinstance(r, dict)]
+    )
 
 
 @mcp.tool()
@@ -621,7 +781,27 @@ def get_threshold_history(start_date: str, end_date: str, aggregation: str = "we
         )
         return _fmt_threshold_history(raw)
 
-    return _tool_call(build)
+    return _dispatch(legacy=build)
+
+
+@mcp.tool()
+def get_hrv(date: str) -> str:
+    """Get overnight heart rate variability (HRV) for the night ending on a date.
+
+    `date` must be "YYYY-MM-DD". Returns a JSON object with the HRV summary
+    (last night's average, weekly average, baseline range and status). The
+    per-reading time series is stripped to keep the response small.
+    """
+
+    def strip(data: Any) -> Any:
+        if isinstance(data, dict):
+            return {k: v for k, v in data.items() if k != "hrvReadings"}
+        return data
+
+    return _dispatch(
+        personal=lambda p: strip(p.get_daily_hrv(date)),
+        legacy=lambda c: strip(c.get_hrv_data(date)),
+    )
 
 
 def _print_tool_list() -> None:
